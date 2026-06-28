@@ -1,0 +1,47 @@
+{
+	"Name": "Device Battery",
+	"Version": "1.0.0.0",
+	"Author": "Pixel",
+	"Actions": [
+		{
+			"Name": "Device Battery",
+			"UUID": "com.pixel.devicebattery.battery",
+			"Icon": "imgs/actions/battery/icon",
+			"Tooltip": "Shows the battery level of a HyperX Cloud 3, Switch Pro Controller or G502 Lightspeed",
+			"PropertyInspectorPath": "ui/propertyInspector.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/battery/categoryIcon",
+					"TitleAlignment": "middle"
+				}
+			]
+		}
+	],
+	"Category": "Device Battery",
+	"CategoryIcon": "imgs/plugin/category-icon",
+	"CodePath": "bin/plugin.js",
+	"Description": "Shows the battery level of a HyperX Cloud 3, Nintendo Switch Pro Controller or Logitech G502 Lightspeed. Pick the device per key.",
+	"Icon": "imgs/plugin/marketplace",
+	"SDKVersion": 2,
+	"Software": {
+		"MinimumVersion": "6.5"
+	},
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "12"
+		},
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
+		}
+	],
+	"Nodejs": {
+		"Version": "20",
+		"Debug": "enabled"
+	},
+	"UUID": "com.pixel.devicebattery"
+}

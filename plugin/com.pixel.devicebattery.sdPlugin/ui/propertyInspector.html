@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Device Battery – Settings</title>
+  <script src="https://sdpi-components.dev/releases/v4/sdpi-components.js"></script>
+</head>
+<body>
+  <sdpi-item label="Device">
+    <sdpi-select setting="device" default="hyperx">
+      <option value="hyperx">HyperX Cloud 3</option>
+      <option value="switchpro">Switch Pro Controller</option>
+      <option value="g502">G502 Lightspeed</option>
+    </sdpi-select>
+  </sdpi-item>
+
+  <sdpi-item label="Show percentage">
+    <sdpi-checkbox setting="showPercent" default="true"></sdpi-checkbox>
+  </sdpi-item>
+
+  <sdpi-item label="Warning threshold (%)">
+    <sdpi-range setting="warnThreshold" min="0" max="100" step="5" showlabels></sdpi-range>
+  </sdpi-item>
+
+  <sdpi-item label="Info">
+    <sdpi-message>
+      Choose which device this key shows. Below the warning threshold the icon turns red;
+      while charging a lightning bolt appears. If the device is off/asleep or the background
+      service isn't running, the icon shows "?".
+    </sdpi-message>
+  </sdpi-item>
+</body>
+</html>

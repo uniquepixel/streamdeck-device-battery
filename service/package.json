@@ -1,0 +1,15 @@
+{
+  "name": "device-battery-service",
+  "version": "1.0.0",
+  "description": "Reads battery levels of a HyperX Cloud 3, Switch Pro Controller and Logitech G502 Lightspeed and broadcasts them over WebSocket for the Stream Deck plugin.",
+  "type": "module",
+  "main": "service.js",
+  "scripts": {
+    "start": "node service.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "node-hid": "^3.2.0",
+    "ws": "^8.18.3"
+  }
+}
