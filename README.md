@@ -4,7 +4,7 @@ A single Elgato Stream Deck plugin that shows the battery level of:
 
 - **HyperX Cloud 3 Wireless** (headset)
 - **Nintendo Switch Pro Controller** (USB and Bluetooth)
-- **Logitech G502 Lightspeed** (mouse, via the Lightspeed receiver)
+- **Logitech G502 Lightspeed** (mouse, via the Lightspeed receiver or USB cable)
 
 Each key picks which device it displays, so you can show all three at once. The
 icon turns **green → amber → red** as the battery drops, shows a **lightning bolt**
@@ -40,8 +40,8 @@ service restart is recovered without restarting Stream Deck.
 | Device | How battery is read |
 | --- | --- |
 | HyperX Cloud 3 | HID VID `0x03F0` / PID `0x05B7`, usage page `65299`. Report header `102`; type `13` byte[4] = level %, type `12` byte[2] = charging, type `11` = powered off. |
-| Switch Pro Controller | HID VID `0x057E` / PID `0x2009`. Battery in byte[2] of report `0x30`/`0x21`: `>>4` = level (8/6/4/2/0 → ~100/75/50/25/5 %), `&1` = charging. Over Bluetooth it boots in "simple" mode (report `0x3F`, no battery); the service sends the `0x03 0x30` subcommand to switch it into the full report. |
-| G502 Lightspeed | Logitech Lightspeed receiver (VID `0x046D` / PID `0xC539`), HID++ 2.0 feature `0x1001` (battery voltage). Voltage (mV) is mapped to a % via a Li-ion discharge curve. Coexists with Logitech G HUB. |
+| Switch Pro Controller | HID VID `0x057E` / PID `0x2009`. Battery in byte[2] of report `0x30`/`0x21`: `>>4` = level (8/6/4/2/0 → ~100/75/50/25/5 %), `&1` = charging. Over Bluetooth it boots in "simple" mode (report `0x3F`, no battery); the service sends the `0x03 0x30` subcommand to switch it into the full report. Over USB the controller is silent until the `0x80` bring-up commands (handshake + "keep HID on USB"), which the service sends before the same subcommand. The cable is preferred when both transports are present. |
+| G502 Lightspeed | HID++ 2.0 feature `0x1001` (battery voltage), read through the Lightspeed receiver (VID `0x046D` / PID `0xC539`) or directly over the cable (PID `0xC08D`, HID++ device index `0xFF`) — the mouse only answers on the transport it is using, so the service follows it. Voltage (mV) is mapped to a % via a Li-ion discharge curve (reads high while charging). Coexists with Logitech G HUB. |
 
 The G502 voltage→percent curve is taken from the
 [Solaar](https://github.com/pwr-Solaar/Solaar) project.

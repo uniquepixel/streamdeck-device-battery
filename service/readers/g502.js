@@ -1,15 +1,21 @@
 import HID from 'node-hid';
 
-// === Logitech G502 Lightspeed (via the Lightspeed USB receiver) ==============
-// The mouse speaks HID++ 2.0 through the receiver. Battery comes from feature
-// 0x1001 (BATTERY_VOLTAGE): the device reports a battery voltage in mV plus a
-// status byte (bit 7 = charging). Voltage is mapped to a % via a Li-ion curve.
-// We resolve the HID++ device index (1..n on the receiver) and the feature
-// index at runtime, then poll periodically and also listen for the device's own
-// spontaneous voltage notifications. Active polling coexists with Logitech G HUB
-// (we tag our requests with a software id and retry transient BUSY errors).
+// === Logitech G502 Lightspeed (receiver or USB cable) ========================
+// The mouse speaks HID++ 2.0 either through the Lightspeed receiver (wireless)
+// or directly when plugged in via cable — the cable makes it enumerate as its
+// own USB device with a different PID, and it only answers on the transport it
+// is currently using, so the reader follows it back and forth. Battery comes
+// from feature 0x1001 (BATTERY_VOLTAGE): the device reports a battery voltage
+// in mV plus a status byte (bit 7 = charging). Voltage is mapped to a % via a
+// Li-ion curve. We resolve the HID++ device index (1..n on the receiver, 0xFF
+// when wired) and the feature index at runtime, then poll periodically and also
+// listen for the device's own spontaneous voltage notifications. Active polling
+// coexists with Logitech G HUB (we tag our requests with a software id and
+// retry transient BUSY errors).
 const LOGITECH = 0x046D;
 const RECEIVER_PID = 0xC539;       // Logitech Lightspeed USB receiver
+const WIRED_PID = 0xC08D;          // G502 Lightspeed plugged in via USB cable
+const WIRED_DEVICE_INDEX = 0xFF;   // HID++ device index for direct-attached devices
 const SW_ID = 0x09;                // software-id tag on our HID++ requests
 const LONG_REPORT_ID = 0x11;       // HID++ long message
 const LONG_LEN = 20;
@@ -17,13 +23,13 @@ const BATTERY_VOLTAGE = 0x1001;    // HID++ 2.0 feature id
 const ERR_REPORT_ID = 0x8f;        // HID++ 2.0 error reply marker (in byte[2])
 const ERR_BUSY = 0x08;
 
+const TICK_MS = 3000;              // connection/transport check cadence
 const POLL_MS = 20000;             // battery poll cadence (battery changes slowly)
 const RESOLVE_MS = 8000;           // retry cadence while receiver is up but mouse asleep
-const RECONNECT_MS = 4000;         // retry cadence while the receiver is missing
 const REQUEST_TIMEOUT_MS = 700;
 const PING_TIMEOUT_MS = 300;
 const BUSY_RETRIES = 6;
-const MAX_DEVICE_INDEX = 3;        // probe device indices 1..3 on the receiver
+const RECEIVER_INDICES = [1, 2, 3]; // device indices to probe on the receiver
 
 // Solaar's Li-ion discharge curve: voltage(mV) -> remaining %.
 const VOLTAGE_CURVE = [
@@ -39,10 +45,13 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 export function createG502Reader() {
   let device = null;
-  let deviceIndex = 0;   // HID++ device index on the receiver (0 = unresolved)
+  let mode = null;       // 'receiver' | 'wired'
+  let deviceIndex = 0;   // HID++ device index (1..n on receiver, 0xFF wired; 0 = unresolved)
   let featureIndex = 0;  // resolved index of feature 0x1001 (0 = unresolved)
   let lastPercent = -1;
   let lastCharging = false;
+  let lastPollAt = 0;
+  let lastResolveAt = 0;
 
   function receiverInfo() {
     return HID.devices().find(d =>
@@ -50,15 +59,29 @@ export function createG502Reader() {
       d.usagePage === 0xFF00 && d.usage === 2);
   }
 
+  // The vendor HID++ interface of the mouse itself when plugged in via cable.
+  // Matched by PID or product name in case the firmware reports a different
+  // PID; modern devices put long HID++ reports on usage page 0xFF43, older
+  // firmwares use 0xFF00 usage 2 like the receiver does.
+  function wiredInfo() {
+    return HID.devices().find(d =>
+      d.vendorId === LOGITECH &&
+      (d.productId === WIRED_PID || /G502/i.test(d.product || '')) &&
+      (d.usagePage === 0xFF43 || (d.usagePage === 0xFF00 && d.usage === 2)));
+  }
+
   function closeDevice() {
     if (device) {
       try { device.close(); } catch { /* ignore */ }
     }
     device = null;
+    mode = null;
     deviceIndex = 0;
     featureIndex = 0;
     lastPercent = -1;
     lastCharging = false;
+    lastPollAt = 0;
+    lastResolveAt = 0;
   }
 
   // Send one HID++ long request and resolve with the first matching reply.
@@ -105,14 +128,15 @@ export function createG502Reader() {
 
   // Find which device index is the mouse and the index of feature 0x1001.
   async function resolveDevice() {
-    for (let idx = 1; idx <= MAX_DEVICE_INDEX; idx++) {
+    const indices = mode === 'wired' ? [WIRED_DEVICE_INDEX] : RECEIVER_INDICES;
+    for (const idx of indices) {
       const ping = await once(idx, 0x00, 0x01, [0, 0, 0xAB], PING_TIMEOUT_MS); // IRoot.getProtocolVersion
       if (!ping.raw) continue;
       const feat = await req(idx, 0x00, 0x00, [(BATTERY_VOLTAGE >> 8) & 0xFF, BATTERY_VOLTAGE & 0xFF]);
       if (feat.raw && !feat.error && feat.raw[4] !== 0) {
         deviceIndex = idx;
         featureIndex = feat.raw[4];
-        console.log(`[g502] resolved device index ${idx}, battery feature index ${featureIndex}`);
+        console.log(`[g502] resolved ${mode} device index ${idx}, battery feature index ${featureIndex}`);
         return true;
       }
     }
@@ -132,8 +156,11 @@ export function createG502Reader() {
     // no reply: mouse asleep -> keep the last known value (battery is unchanged)
   }
 
-  function openReceiver() {
-    const info = receiverInfo();
+  // Open whichever transport the mouse is currently on; the cable wins because
+  // the mouse stops answering through the receiver while it is plugged in.
+  function openDevice() {
+    const wired = wiredInfo();
+    const info = wired || receiverInfo();
     if (!info) return false;
     try {
       device = new HID.HID(info.path);
@@ -141,7 +168,8 @@ export function createG502Reader() {
       device = null;
       return false;
     }
-    console.log('[g502] receiver opened');
+    mode = wired ? 'wired' : 'receiver';
+    console.log(`[g502] ${mode} interface opened`);
     // Always-on listener for the device's spontaneous voltage notifications.
     device.on('data', (data) => {
       const d = [...data];
@@ -155,24 +183,29 @@ export function createG502Reader() {
   }
 
   async function tick() {
-    if (!device) {
-      openReceiver();
-      return;
-    }
+    // Follow the mouse when it hops transports (cable plugged in / pulled out).
+    const wiredPresent = !!wiredInfo();
+    if (device && mode === 'receiver' && wiredPresent) closeDevice();
+    if (device && mode === 'wired' && !wiredPresent) closeDevice();
+
+    if (!device && !openDevice()) return;
+    const now = Date.now();
     if (!deviceIndex || !featureIndex) {
-      if (await resolveDevice()) await poll();
+      if (now - lastResolveAt < RESOLVE_MS && lastResolveAt) return;
+      lastResolveAt = now;
+      if (!(await resolveDevice())) return;
+    } else if (now - lastPollAt < POLL_MS) {
       return;
     }
     await poll();
+    lastPollAt = Date.now();
   }
 
-  // Self-scheduling loop so requests never overlap; cadence depends on state.
+  // Self-scheduling loop so requests never overlap. Ticks are frequent so a
+  // transport switch is picked up quickly; resolve/poll throttle themselves.
   async function loop() {
     try { await tick(); } catch { /* ignore */ }
-    const delay = (device && deviceIndex && featureIndex) ? POLL_MS
-      : device ? RESOLVE_MS
-        : RECONNECT_MS;
-    setTimeout(loop, delay);
+    setTimeout(loop, TICK_MS);
   }
 
   return {
