@@ -1,4 +1,45 @@
 import HID from 'node-hid';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+// === Logitech G HUB local database (preferred battery source) ===============
+// G HUB itself already talks HID++ to the mouse and stores its own calibrated
+// battery reading in a local SQLite settings file, refreshed continuously
+// while G HUB is running. That reading is far more trustworthy than voltage
+// guessed from a single poll: it doesn't get fooled by the terminal-voltage
+// spike that happens while the mouse is actively charging (our own curve-based
+// estimate does, since charging current pushes measured voltage well above
+// what the discharge curve assumes). When G HUB is running we prefer its
+// percentage and fall back to our own HID++ voltage read otherwise.
+const GHUB_DB_PATH = process.env.LOCALAPPDATA
+  ? path.join(process.env.LOCALAPPDATA, 'LGHUB', 'settings.db')
+  : null;
+const GHUB_MAX_AGE_MS = 5 * 60 * 1000; // ignore stale G HUB snapshots, fall back to direct read
+const GHUB_BATTERY_KEY = /^battery\/.+\/percentage$/;
+
+function readGhubBattery() {
+  if (!GHUB_DB_PATH) return null;
+  let db;
+  try {
+    db = new DatabaseSync(GHUB_DB_PATH, { readOnly: true });
+    const row = db.prepare('SELECT file FROM data ORDER BY _id DESC LIMIT 1').get();
+    if (!row) return null;
+    const settings = JSON.parse(Buffer.from(row.file).toString('utf8'));
+    const key = Object.keys(settings).find((k) => GHUB_BATTERY_KEY.test(k));
+    const entry = key && settings[key];
+    if (!entry || typeof entry.percentage !== 'number') return null;
+    const age = Date.now() - new Date(entry.time).getTime();
+    if (!(age >= 0) || age > GHUB_MAX_AGE_MS) return null;
+    return {
+      percentage: entry.percentage,
+      charging: typeof entry.isCharging === 'boolean' ? entry.isCharging : undefined,
+    };
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
 
 // === Logitech G502 Lightspeed (receiver or USB cable) ========================
 // The mouse speaks HID++ 2.0 either through the Lightspeed receiver (wireless)
@@ -36,8 +77,15 @@ const VOLTAGE_CURVE = [
   [4186, 100], [4067, 90], [3989, 80], [3922, 70], [3859, 60], [3811, 50],
   [3778, 40], [3751, 30], [3717, 20], [3651, 10], [3567, 5], [3525, 2], [3490, 0],
 ];
+// Linear interpolation between curve points instead of snapping down to the
+// nearest one, so the fallback estimate isn't stuck on multiples of 10.
 function voltageToPercent(mv) {
-  for (const [v, p] of VOLTAGE_CURVE) if (mv >= v) return p;
+  if (mv >= VOLTAGE_CURVE[0][0]) return 100;
+  for (let i = 0; i < VOLTAGE_CURVE.length - 1; i++) {
+    const [vHi, pHi] = VOLTAGE_CURVE[i];
+    const [vLo, pLo] = VOLTAGE_CURVE[i + 1];
+    if (mv >= vLo) return Math.round(pLo + ((mv - vLo) / (vHi - vLo)) * (pHi - pLo));
+  }
   return 0;
 }
 
@@ -154,6 +202,14 @@ export function createG502Reader() {
     const r = await req(deviceIndex, featureIndex, 0x00); // getBatteryVoltage
     if (r.raw && !r.error) decodeVoltage(r.raw);
     // no reply: mouse asleep -> keep the last known value (battery is unchanged)
+
+    // G HUB's own calibrated reading overrides our voltage-based estimate
+    // whenever it's available and fresh.
+    const ghub = readGhubBattery();
+    if (ghub) {
+      lastPercent = ghub.percentage;
+      if (typeof ghub.charging === 'boolean') lastCharging = ghub.charging;
+    }
   }
 
   // Open whichever transport the mouse is currently on; the cable wins because
