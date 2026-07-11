@@ -1,44 +1,111 @@
 import HID from 'node-hid';
-import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import WebSocket from 'ws';
 
-// === Logitech G HUB local database (preferred battery source) ===============
-// G HUB itself already talks HID++ to the mouse and stores its own calibrated
-// battery reading in a local SQLite settings file, refreshed continuously
-// while G HUB is running. That reading is far more trustworthy than voltage
-// guessed from a single poll: it doesn't get fooled by the terminal-voltage
-// spike that happens while the mouse is actively charging (our own curve-based
-// estimate does, since charging current pushes measured voltage well above
-// what the discharge curve assumes). When G HUB is running we prefer its
-// percentage and fall back to our own HID++ voltage read otherwise.
-const GHUB_DB_PATH = process.env.LOCALAPPDATA
-  ? path.join(process.env.LOCALAPPDATA, 'LGHUB', 'settings.db')
-  : null;
-const GHUB_MAX_AGE_MS = 5 * 60 * 1000; // ignore stale G HUB snapshots, fall back to direct read
-const GHUB_BATTERY_KEY = /^battery\/.+\/percentage$/;
+// === Logitech G HUB agent API (preferred battery source) =====================
+// G HUB's background agent exposes the same local WebSocket API its own UI
+// uses (ws://127.0.0.1:9010, subprotocol "json"). GET /battery/<id>/state
+// returns the calibrated state-of-charge the G HUB window displays — the mouse
+// supports real SoC reporting (batteryStateOfChargeSupport), so this reading
+// stays correct while charging, unlike a voltage estimate: charging current
+// pushes the measured terminal voltage far above what a discharge curve
+// assumes (observed: 4155 mV while charging → curve says 97%, true SoC 58%).
+// We keep a persistent connection, poll the state, and subscribe to pushed
+// battery events. When G HUB isn't running we fall back to our own HID++
+// voltage read. (The previous approach — reading G HUB's settings.db — was
+// unreliable: the battery key only intermittently exists in that file.)
+const GHUB_WS_URL = 'ws://127.0.0.1:9010';
+const GHUB_POLL_MS = 10000;        // refresh cadence for /battery/<id>/state
+const GHUB_RECONNECT_MS = 15000;   // retry cadence while G HUB is not running
+const GHUB_MAX_AGE_MS = 60000;     // reading older than this -> fall back to voltage
 
-function readGhubBattery() {
-  if (!GHUB_DB_PATH) return null;
-  let db;
-  try {
-    db = new DatabaseSync(GHUB_DB_PATH, { readOnly: true });
-    const row = db.prepare('SELECT file FROM data ORDER BY _id DESC LIMIT 1').get();
-    if (!row) return null;
-    const settings = JSON.parse(Buffer.from(row.file).toString('utf8'));
-    const key = Object.keys(settings).find((k) => GHUB_BATTERY_KEY.test(k));
-    const entry = key && settings[key];
-    if (!entry || typeof entry.percentage !== 'number') return null;
-    const age = Date.now() - new Date(entry.time).getTime();
-    if (!(age >= 0) || age > GHUB_MAX_AGE_MS) return null;
-    return {
-      percentage: entry.percentage,
-      charging: typeof entry.isCharging === 'boolean' ? entry.isCharging : undefined,
-    };
-  } catch {
-    return null;
-  } finally {
-    try { db?.close(); } catch { /* ignore */ }
+function createGhubClient(onUpdate) {
+  let ws = null;
+  let deviceId = null;
+  let pollTimer = null;
+  let lastUpdateAt = 0;
+  let announced = false;
+  let stopped = false;
+
+  function send(path, verb = 'GET') {
+    try { ws.send(JSON.stringify({ msgId: '', verb, path })); } catch { /* ignore */ }
   }
+
+  function cleanup() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (ws) { try { ws.terminate(); } catch { /* ignore */ } }
+    ws = null;
+    deviceId = null;
+    announced = false;
+  }
+
+  // Runs on a fixed cadence once connected. Requests are fire-and-forget, so a
+  // lost or ignored reply (the agent occasionally drops the first request
+  // right after its OPTIONS handshake) must not stall the client: while the
+  // device is unresolved we keep re-asking for the device list, and if battery
+  // updates stop arriving we re-resolve in case G HUB re-enumerated the device
+  // under a new id.
+  function pollTick() {
+    if (!deviceId || Date.now() - lastUpdateAt > 3 * GHUB_POLL_MS) {
+      send('/devices/list');
+    }
+    if (deviceId) send(`/battery/${deviceId}/state`);
+  }
+
+  function connect() {
+    if (stopped) return;
+    const sock = new WebSocket(GHUB_WS_URL, 'json', { handshakeTimeout: 3000 });
+    ws = sock;
+
+    sock.on('open', () => {
+      console.log('[g502] G HUB agent connected');
+      send('/devices/list');
+      pollTimer = setInterval(pollTick, GHUB_POLL_MS);
+    });
+
+    sock.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      const payload = msg?.payload;
+
+      if (msg?.path === '/devices/list' && Array.isArray(payload?.deviceInfos)) {
+        const dev = payload.deviceInfos.find((d) => /g502/i.test(d.deviceModel || ''))
+          ?? payload.deviceInfos.find((d) => d.deviceType === 'MOUSE');
+        if (!dev) return;
+        deviceId = dev.id;
+        if (!announced) {
+          announced = true;
+          console.log(`[g502] G HUB battery source active (${dev.displayName || deviceId})`);
+        }
+        send(`/battery/${deviceId}/state`);
+        send('/battery/state/changed', 'SUBSCRIBE');
+        return;
+      }
+
+      // Battery state — either our GET reply or a pushed /battery/state/changed
+      // event; both carry the same payload shape.
+      if (deviceId && payload?.deviceId === deviceId && typeof payload.percentage === 'number') {
+        lastUpdateAt = Date.now();
+        onUpdate({
+          percent: payload.fullyCharged ? 100 : payload.percentage,
+          charging: !!payload.charging,
+          at: lastUpdateAt,
+        });
+      }
+    });
+
+    const retry = () => {
+      if (ws !== sock) return; // stale socket
+      cleanup();
+      if (!stopped) setTimeout(connect, GHUB_RECONNECT_MS);
+    };
+    sock.on('close', retry);
+    sock.on('error', retry);
+  }
+
+  return {
+    start() { connect(); },
+    stop() { stopped = true; cleanup(); },
+  };
 }
 
 // === Logitech G502 Lightspeed (receiver or USB cable) ========================
@@ -47,12 +114,12 @@ function readGhubBattery() {
 // own USB device with a different PID, and it only answers on the transport it
 // is currently using, so the reader follows it back and forth. Battery comes
 // from feature 0x1001 (BATTERY_VOLTAGE): the device reports a battery voltage
-// in mV plus a status byte (bit 7 = charging). Voltage is mapped to a % via a
-// Li-ion curve. We resolve the HID++ device index (1..n on the receiver, 0xFF
-// when wired) and the feature index at runtime, then poll periodically and also
-// listen for the device's own spontaneous voltage notifications. Active polling
-// coexists with Logitech G HUB (we tag our requests with a software id and
-// retry transient BUSY errors).
+// in mV plus a status byte (bit 7 = external power). Voltage is mapped to a %
+// via a Li-ion curve. We resolve the HID++ device index (1..n on the receiver,
+// 0xFF when wired) and the feature index at runtime, then poll periodically and
+// also listen for the device's own spontaneous voltage notifications. Active
+// polling coexists with Logitech G HUB (we tag our requests with a software id
+// and retry transient BUSY errors).
 const LOGITECH = 0x046D;
 const RECEIVER_PID = 0xC539;       // Logitech Lightspeed USB receiver
 const WIRED_PID = 0xC08D;          // G502 Lightspeed plugged in via USB cable
@@ -72,18 +139,30 @@ const PING_TIMEOUT_MS = 300;
 const BUSY_RETRIES = 6;
 const RECEIVER_INDICES = [1, 2, 3]; // device indices to probe on the receiver
 
-// Solaar's Li-ion discharge curve: voltage(mV) -> remaining %.
-const VOLTAGE_CURVE = [
+// Solaar's Li-ion discharge curve: voltage(mV) -> remaining %. Only valid while
+// the battery is actually discharging.
+const DISCHARGE_CURVE = [
   [4186, 100], [4067, 90], [3989, 80], [3922, 70], [3859, 60], [3811, 50],
   [3778, 40], [3751, 30], [3717, 20], [3651, 10], [3567, 5], [3525, 2], [3490, 0],
 ];
+// Rough curve for while the mouse is charging: the charge current lifts the
+// terminal voltage by up to ~300 mV, so the discharge curve wildly
+// overestimates. Anchored on one calibration point from G HUB (4155 mV = 58 %);
+// above ~4.19 V the charger is in its constant-voltage phase where voltage
+// carries no SoC information at all, so the estimate saturates at 80 % until
+// the device reports "full". Only used when G HUB isn't running.
+const CHARGE_CURVE = [
+  [4190, 80], [4155, 58], [4100, 50], [4000, 36], [3900, 24],
+  [3800, 14], [3700, 7], [3600, 2], [3500, 0],
+];
+
 // Linear interpolation between curve points instead of snapping down to the
-// nearest one, so the fallback estimate isn't stuck on multiples of 10.
-function voltageToPercent(mv) {
-  if (mv >= VOLTAGE_CURVE[0][0]) return 100;
-  for (let i = 0; i < VOLTAGE_CURVE.length - 1; i++) {
-    const [vHi, pHi] = VOLTAGE_CURVE[i];
-    const [vLo, pLo] = VOLTAGE_CURVE[i + 1];
+// nearest one, so the fallback estimate isn't stuck on the anchor values.
+function voltageToPercent(mv, curve) {
+  if (mv >= curve[0][0]) return curve[0][1];
+  for (let i = 0; i < curve.length - 1; i++) {
+    const [vHi, pHi] = curve[i];
+    const [vLo, pLo] = curve[i + 1];
     if (mv >= vLo) return Math.round(pLo + ((mv - vLo) / (vHi - vLo)) * (pHi - pLo));
   }
   return 0;
@@ -96,10 +175,21 @@ export function createG502Reader() {
   let mode = null;       // 'receiver' | 'wired'
   let deviceIndex = 0;   // HID++ device index (1..n on receiver, 0xFF wired; 0 = unresolved)
   let featureIndex = 0;  // resolved index of feature 0x1001 (0 = unresolved)
-  let lastPercent = -1;
-  let lastCharging = false;
   let lastPollAt = 0;
   let lastResolveAt = 0;
+
+  // The two battery sources are kept strictly separate so a voltage frame can
+  // never overwrite a fresh G HUB reading. That matters doubly because our HID
+  // handle also receives the replies to G HUB's *own* HID++ polling — the
+  // spontaneous-notification listener fires constantly while G HUB runs.
+  let volt = null;       // { percent, charging, at } — our HID++ voltage estimate
+  let ghub = null;       // { percent, charging, at } — G HUB's calibrated reading
+
+  const ghubClient = createGhubClient((reading) => { ghub = reading; });
+
+  function freshGhub() {
+    return ghub && Date.now() - ghub.at <= GHUB_MAX_AGE_MS ? ghub : null;
+  }
 
   function receiverInfo() {
     return HID.devices().find(d =>
@@ -126,8 +216,7 @@ export function createG502Reader() {
     mode = null;
     deviceIndex = 0;
     featureIndex = 0;
-    lastPercent = -1;
-    lastCharging = false;
+    volt = null; // voltage regime changes on plug/unplug; ghub stays valid
     lastPollAt = 0;
     lastResolveAt = 0;
   }
@@ -191,25 +280,21 @@ export function createG502Reader() {
     return false;
   }
 
+  // Feature 0x1001 payload: voltage mV (2 bytes) then a flags byte —
+  // bit 7 = external power, low bits = charge status (1 = charge complete).
   function decodeVoltage(d) {
     const mv = (d[4] << 8) | d[5];
     if (mv < 2000 || mv > 5000) return; // sanity
-    lastPercent = voltageToPercent(mv);
-    lastCharging = (d[6] & 0x80) !== 0;
+    const external = (d[6] & 0x80) !== 0;
+    const full = external && (d[6] & 0x07) === 1;
+    const percent = full ? 100 : voltageToPercent(mv, external ? CHARGE_CURVE : DISCHARGE_CURVE);
+    volt = { percent, charging: external && !full, at: Date.now() };
   }
 
   async function poll() {
     const r = await req(deviceIndex, featureIndex, 0x00); // getBatteryVoltage
     if (r.raw && !r.error) decodeVoltage(r.raw);
     // no reply: mouse asleep -> keep the last known value (battery is unchanged)
-
-    // G HUB's own calibrated reading overrides our voltage-based estimate
-    // whenever it's available and fresh.
-    const ghub = readGhubBattery();
-    if (ghub) {
-      lastPercent = ghub.percentage;
-      if (typeof ghub.charging === 'boolean') lastCharging = ghub.charging;
-    }
   }
 
   // Open whichever transport the mouse is currently on; the cable wins because
@@ -226,7 +311,9 @@ export function createG502Reader() {
     }
     mode = wired ? 'wired' : 'receiver';
     console.log(`[g502] ${mode} interface opened`);
-    // Always-on listener for the device's spontaneous voltage notifications.
+    // Always-on listener for the device's spontaneous voltage notifications
+    // (this also sees replies to G HUB's own polling — harmless, since it only
+    // ever updates the voltage-based fallback source).
     device.on('data', (data) => {
       const d = [...data];
       if (deviceIndex && featureIndex &&
@@ -267,10 +354,13 @@ export function createG502Reader() {
   return {
     id: 'g502',
     name: 'G502 Lightspeed',
-    start() { loop(); },
+    start() { loop(); ghubClient.start(); },
     getState() {
-      if (!device || lastPercent < 0) return { connected: false };
-      return { connected: true, value: lastPercent, charging: lastCharging };
+      // G HUB's calibrated reading wins whenever it's fresh; our voltage
+      // estimate only fills in while G HUB isn't running.
+      const src = freshGhub() || volt;
+      if (!device || !src) return { connected: false };
+      return { connected: true, value: src.percent, charging: src.charging };
     },
   };
 }

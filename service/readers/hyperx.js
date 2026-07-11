@@ -5,6 +5,7 @@ import HID from 'node-hid';
 //   12 -> charging state: byte[2] = 1 (charging) / 0 (on battery)
 //   13 -> battery state:  byte[4] = charge level in %  (0 => headset off)
 //   11 -> headset was powered off
+//   137 -> reply to our own battery poll (0x66 0x89): byte[4] = charge level
 //   other (e.g. 0x8x) -> radio handshake on power-on, ignored
 const VENDOR_ID = 0x03F0;
 const PRODUCT_ID = 0x05B7;
@@ -14,11 +15,17 @@ const REPORT_HEADER = 102;
 const TYPE_CHARGING = 12;
 const TYPE_BATTERY = 13;
 const TYPE_POWER_OFF = 11;
+const TYPE_POLL_REPLY = 137;
+const REPORT_LEN = 62;
 
 // On power-on there are brief "11/0" reports during the radio handshake. An
 // "off" is therefore only honoured if no valid battery report arrived recently.
 const OFF_DEBOUNCE_MS = 2000;
 const RECONNECT_INTERVAL_MS = 3000;
+// The dongle only pushes battery reports on changes, so after a service
+// restart the level would stay unknown for a long time. It answers an active
+// poll (0x66 0x89) immediately, so we ask on connect and then periodically.
+const POLL_INTERVAL_MS = 60000;
 
 export function createHyperXReader() {
   let device = null;
@@ -38,6 +45,7 @@ export function createHyperXReader() {
         lastCharging = d[2] === 1;
         break;
       case TYPE_BATTERY:
+      case TYPE_POLL_REPLY:
         if (d[4] > 0) {
           lastBatteryLevel = d[4];
           lastBatteryAt = Date.now();
@@ -60,6 +68,14 @@ export function createHyperXReader() {
     device = null;
   }
 
+  function pollBattery() {
+    if (!device) return;
+    const buf = Buffer.alloc(REPORT_LEN);
+    buf[0] = REPORT_HEADER;
+    buf[1] = TYPE_POLL_REPLY;
+    try { device.write([...buf]); } catch { /* ignore */ }
+  }
+
   function connect() {
     const info = HID.devices().find(d =>
       d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID && d.usagePage === USAGE_PAGE);
@@ -73,6 +89,7 @@ export function createHyperXReader() {
     console.log('[hyperx] connected:', info.product || info.path);
     device.on('data', data => handleReport([...data]));
     device.on('error', () => { closeDevice(); });
+    pollBattery();
   }
 
   return {
@@ -81,6 +98,7 @@ export function createHyperXReader() {
     start() {
       connect();
       setInterval(() => { if (!device) connect(); }, RECONNECT_INTERVAL_MS);
+      setInterval(pollBattery, POLL_INTERVAL_MS);
     },
     getState() {
       if (!device || !headsetOn || lastBatteryLevel < 0) return { connected: false };
